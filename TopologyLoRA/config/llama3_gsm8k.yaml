@@ -1,0 +1,23 @@
+exp_name: "topologylora_llama3_gsm8k"
+model_id: "meta-llama/Meta-Llama-3-8B"
+target_modules: 
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "o_proj"
+  - "gate_proj"
+  - "up_proj"
+  - "down_proj"
+
+# TopologyLoRA Allocator Params
+max_rank: 64
+min_rank: 4
+beta: 2.5 # Sparsity parameter: higher beta leads to more concentrated rank allocation
+lora_alpha: 128
+dropout: 0.05
+
+# Optimization Params
+batch_size: 2
+grad_acc: 8
+lr: 2e-4
+epochs: 3
