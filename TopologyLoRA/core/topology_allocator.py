@@ -79,17 +79,18 @@ class TopologyRankAllocator:
         2. Normalize scores s_m to [0, 1] range for stability.
         3. Apply Soft Scaling formula:
            r_m = R_min + (R_max - R_min) * [exp(beta * s_norm_m) / exp(beta)]
-           This ensures core nodes get max_rank while support nodes get min_rank.
         """
         scores_dict = self.compute_centrality()
         
-        # Filter nodes that match transformer layers (e.g., 'layer_31', 'L31')
-        layer_nodes = [n for n in scores_dict.keys() if any(x in n.lower() for x in ["layer", "block", "l"])]
-        if not layer_nodes:
-            logger.error("No valid layer nodes found. Check if graphghost node labeling matches expectation.")
+        # In Qwen3 extraction, nodes are already full paths like 'model.layers.0.self_attn.q_proj'
+        # We only keep nodes that are actually present in our target_modules list or contain layer info
+        valid_nodes = [n for n in scores_dict.keys() if "layers" in n.lower()]
+        
+        if not valid_nodes:
+            logger.error("No valid model nodes found in graph. Check node labeling.")
             return {}
 
-        s_vals = np.array([scores_dict[n] for n in layer_nodes])
+        s_vals = np.array([scores_dict[n] for n in valid_nodes])
         # Min-Max normalization
         s_norm = (s_vals - s_vals.min()) / (s_vals.max() - s_vals.min() + 1e-9)
         
@@ -101,28 +102,21 @@ class TopologyRankAllocator:
         ranks = np.round(ranks).astype(int)
 
         rank_pattern = {}
-        for idx, node in enumerate(layer_nodes):
-            module_base = self._map_node_to_hf(node)
-            if module_base:
-                # Apply computed rank to all target modules in this topological block
-                for target in self.target_modules:
-                    # In PEFT rank_pattern, we use the specific sub-module path
-                    full_path = f"{module_base}.{target}"
-                    rank_pattern[full_path] = int(ranks[idx])
+        for idx, node in enumerate(valid_nodes):
+            # The node in the graph (e.g., 'model.layers.0.self_attn.q_proj') 
+            # might need some suffix cleanup depending on how PEFT expects the pattern.
+            # Usually PEFT rank_pattern expects the name relative to the base model.
+            
+            # If the node is 'model.layers.0.self_attn.q_proj', PEFT pattern can match it.
+            # We filter for modules that match our target_modules if necessary.
+            if any(target in node for target in self.target_modules):
+                # PEFT rank_pattern matches the module name (the part that LoRA is applied to)
+                # Example: 'model.layers.0.self_attn.q_proj'
+                rank_pattern[node] = int(ranks[idx])
         
         logger.success(f"Generated rank pattern for {len(rank_pattern)} sub-modules.")
         return rank_pattern
 
     def _map_node_to_hf(self, node_name: str) -> Optional[str]:
-        """Maps graph nodes (e.g. 'L31_attn') to HF module paths (e.g. 'model.layers.31.self_attn')."""
-        match = re.search(r'(?:layer|l)_?(\d+)', node_name, re.IGNORECASE)
-        if not match: return None
-        layer_idx = match.group(1)
-        
-        # Heuristic mapping for Llama-3/Llama-2
-        if "attn" in node_name.lower():
-            return f"model.layers.{layer_idx}.self_attn"
-        elif "mlp" in node_name.lower():
-            return f"model.layers.{layer_idx}.mlp"
-        else:
-            return f"model.layers.{layer_idx}"
+        # This function is now deprecated for full-path graphs but kept for backward compatibility
+        return node_name

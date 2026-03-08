@@ -80,7 +80,7 @@ if __name__ == "__main__":
     ]
 
     run_scientific_extraction(
-        model_id="meta-llama/Meta-Llama-3-8B",
+        model_id=r"D:\code\model\Qwen3-1.7B",
         calibration_set=reasoning_tasks,
         output_file="../reasoning_circuit_robust.pkl",
         threshold=0.05

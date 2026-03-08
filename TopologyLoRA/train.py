@@ -45,8 +45,8 @@ def main():
     rank_pattern = allocator.get_rank_pattern()
 
     # 2. Setup Model & Tokenizer
-    model_id = cfg['model_id']
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model_id = os.path.abspath(cfg['model_id']) if os.path.exists(cfg['model_id']) else cfg['model_id']
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
     logger.info(f"Loading {model_id} in BF16...")
@@ -87,7 +87,7 @@ def main():
         bf16=True,
         logging_steps=10,
         save_strategy="epoch",
-        evaluation_strategy="no",
+        eval_strategy="no",
         lr_scheduler_type="cosine",
         warmup_steps=100
     )
