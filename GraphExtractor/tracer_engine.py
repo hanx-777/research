@@ -1,108 +1,101 @@
 import torch
 import torch.nn as nn
 import networkx as nx
+import numpy as np
 from typing import Dict, List, Tuple
+from tqdm import tqdm
 from loguru import logger
 
-class CircuitTracer:
+class IFCCircuitTracer:
     """
-    Academic implementation of GraphGhost's circuit tracing logic.
-    Captures the 'Implicit Reasoning Graph' by monitoring the attribution flow
-    through the transformer modules.
+    IFCLora 核心电路追踪引擎。
+    提取多维指标：Flow (激活流), GradSensi (梯度敏感度), PertImpi (扰动重要性)。
+    参考 GraphGhost 设计，并内化核心逻辑。
     """
-    def __init__(self, model: nn.Module):
+    def __init__(self, model: nn.Module, tokenizer):
         self.model = model
-        self.activations = {}
-        self.gradients = {}
+        self.tokenizer = tokenizer
+        self.node_metrics = {}
         self.hooks = []
-        # Target internal components matching GraphGhost's granularity
+        # 目标组件：Llama 各层的投影矩阵
         self.targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
-    def _hook_fn(self, name):
+    def _get_ifc_hook(self, name):
+        """生成捕获激活值与梯度的 Hook。"""
         def forward_hook(module, input, output):
-            self.activations[name] = output[0].detach() if isinstance(output, tuple) else output.detach()
+            module.act_cache = output[0].detach() if isinstance(output, tuple) else output.detach()
+            
         def backward_hook(module, grad_in, grad_out):
-            self.gradients[name] = grad_out[0].detach()
+            if not hasattr(module, 'act_cache'): return
+            
+            grad = grad_out[0].detach()
+            act = module.act_cache.detach()
+            
+            # 1. GradSensi (梯度敏感度): ||grad||_1
+            grad_sensi = grad.float().abs().sum().item()
+            
+            # 2. PertImpi (扰动重要性): 泰勒展开 |grad * act|
+            pert_imp = (grad.float() * act.float()).abs().sum().item()
+            
+            if name not in self.node_metrics:
+                self.node_metrics[name] = {"grad_sensi": [], "pert_imp": []}
+            self.node_metrics[name]["grad_sensi"].append(grad_sensi)
+            self.node_metrics[name]["pert_imp"].append(pert_imp)
+            
         return forward_hook, backward_hook
 
     def register_hooks(self):
-        logger.info("Registering attribution hooks on model components...")
+        logger.info("正在注册 IFCLora 归因钩子 (Multi-metric Hooks)...")
         for name, module in self.model.named_modules():
             if any(name.endswith(t) for t in self.targets):
-                f_hook, b_hook = self._hook_fn(name)
+                f_hook, b_hook = self._get_ifc_hook(name)
                 self.hooks.append(module.register_forward_hook(f_hook))
                 self.hooks.append(module.register_full_backward_hook(b_hook))
 
-    def clear_hooks(self):
-        for h in self.hooks:
-            h.remove()
+    def remove_hooks(self):
+        for h in self.hooks: h.remove()
         self.hooks = []
 
-    def trace(self, input_ids: torch.Tensor) -> Dict[str, float]:
-        """Performs a single attribution pass using |Activation * Gradient|."""
-        self.model.zero_grad()
-        # Ensure we compute loss for backward
-        outputs = self.model(input_ids, labels=input_ids)
-        loss = outputs.loss
-        loss.backward()
+    def extract_metrics(self, calibration_set: List[str]) -> nx.DiGraph:
+        """
+        在多样本校准集上提取指标，并构建带权拓扑图。
+        """
+        self.node_metrics = {}
+        self.model.eval()
 
-        attribution = {}
-        for name in self.activations:
-            if name in self.gradients:
-                # Use the Scientific Attribution method
-                score = (self.activations[name].float() * self.gradients[name].float()).abs().sum().item()
-                attribution[name] = score
-        return attribution
+        for prompt in tqdm(calibration_set, desc="校准多维指标"):
+            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+            outputs = self.model(**inputs, labels=inputs["input_ids"])
+            loss = outputs.loss
+            self.model.zero_grad()
+            loss.backward()
 
-class GraphBuilder:
-    """
-    Constructs the Circuit Graph (Topology) from attribution data.
-    Mimics GraphGhost's Graph construction with sequence-aware edges.
-    """
-    @staticmethod
-    def build_circuit(attribution: Dict[str, float], threshold_ratio: float = 0.05) -> nx.DiGraph:
+        # 聚合指标 (Mean Aggregation)
+        final_nodes = {}
+        for name, data in self.node_metrics.items():
+            final_nodes[name] = {
+                "grad_sensi": np.mean(data["grad_sensi"]),
+                "pert_imp": np.mean(data["pert_imp"])
+            }
+
+        # 构建图以计算 Flow (PageRank)
         G = nx.DiGraph()
-        
-        if not attribution:
-            return G
-
-        # 1. Normalize attribution scores
-        max_score = max(attribution.values())
-        normalized_attr = {k: v / max_score for k, v in attribution.items()}
-        
-        # 2. Add Nodes (Prune insignificant nodes)
-        for name, score in normalized_attr.items():
-            if score >= threshold_ratio:
-                G.add_node(name, weight=score)
-
-        # 3. Add Causal Edges
         import re
-        def get_layer_info(name):
-            match = re.search(r'layers\.(\d+)', name)
-            layer_idx = int(match.group(1)) if match else -1
-            is_mlp = 'mlp' in name
-            return layer_idx, is_mlp
+        def get_layer_info(n):
+            match = re.search(r'layers\.(\d+)', n)
+            return int(match.group(1)) if match else -1
 
-        sorted_nodes = sorted(G.nodes(), key=lambda x: (get_layer_info(x), x))
+        sorted_names = sorted(final_nodes.keys(), key=lambda x: (get_layer_info(x), x))
         
-        for i, u in enumerate(sorted_nodes):
-            u_idx, u_is_mlp = get_layer_info(u)
+        for i, name in enumerate(sorted_names):
+            # 将归因数据存入节点
+            G.add_node(name, **final_nodes[name])
             
-            for j in range(i + 1, min(i + 15, len(sorted_nodes))):
-                v = sorted_nodes[j]
-                v_idx, v_is_mlp = get_layer_info(v)
-                
-                # Causal logic: 
-                # Same layer: Attention components flow toward MLP components
-                # Across layers: Layer N flows to Layer N+1
-                edge_weight = normalized_attr[v]
-                if v_idx == u_idx:
-                    if not u_is_mlp and v_is_mlp:
-                        G.add_edge(u, v, weight=edge_weight)
-                elif v_idx == u_idx + 1:
-                    G.add_edge(u, v, weight=edge_weight * 0.8)
-                elif v_idx > u_idx + 1:
-                    # Long-range residual influence
-                    G.add_edge(u, v, weight=edge_weight * 0.2)
+            # 构建因果边以支撑 PageRank 计算 (Flow)
+            for j in range(i + 1, min(i + 10, len(sorted_names))):
+                v = sorted_names[j]
+                # 边的权重取决于目标节点的重要性，这符合 PageRank 的“含金量”逻辑
+                G.add_edge(name, v, weight=final_nodes[v]["pert_imp"])
 
+        logger.success(f"已提取包含 {G.number_of_nodes()} 个节点的 IFCLora 基础图。")
         return G
