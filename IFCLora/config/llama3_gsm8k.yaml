@@ -1,0 +1,20 @@
+exp_name: "ifclora_llama3_gsm8k"
+model_id: "meta-llama/Meta-Llama-3-8B"
+
+# IFCLora核心公式超参数 (Alpha + Beta + Gamma = 1)
+alpha: 0.4  # Flow: PageRank中心性权重
+beta: 0.3   # GradSensi: 梯度敏感度权重
+gamma: 0.3  # PertImpi: 泰勒扰动重要性权重
+
+# 秩分配控制
+max_rank: 64
+min_rank: 4
+scaling_beta: 2.0  # 控制分配稀疏度的逆温度系数
+
+# 训练超参数
+target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+lora_alpha: 128
+batch_size: 2
+grad_acc: 8
+lr: 2e-4
+epochs: 3
